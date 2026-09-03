@@ -18,7 +18,15 @@ def lookup(query, extra=None):
         "fhir-bundle-validator": [("Patient","patient"),("Observation","observation")],
         "cyp-drug-interaction-checker": [("CYP3A4 substrate","cyp3a4"),("CYP2D6 inhibitor","cyp2d6")],
     }
-    candidates = bank.get("blood-culture-contamination-tracker", [("generic hit","generic")])
+    candidates = bank.get("blood-culture-contamination-tracker", [
+        ("Staphylococcus aureus (Pathogen)", "staphylococcus_aureus"),
+        ("Escherichia coli (Pathogen)", "escherichia_coli"),
+        ("Coagulase-negative Staphylococcus (Skin Contaminant)", "coagulase_negative_staphylococcus"),
+        ("Cutibacterium acnes (Skin Contaminant)", "cutibacterium_acnes"),
+        ("Corynebacterium species (Skin Contaminant)", "corynebacterium_species"),
+        ("Pseudomonas aeruginosa (Pathogen)", "pseudomonas_aeruginosa"),
+        ("Streptococcus pneumoniae (Pathogen)", "streptococcus_pneumoniae"),
+    ])
     scored=[]
     for label,key in candidates:
         score = 0
