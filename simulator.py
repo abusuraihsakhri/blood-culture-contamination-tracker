@@ -1,67 +1,87 @@
-"""
-Distributed Component High-Throughput Traffic & Stress Testing Simulator for Blood Culture Contamination Tracker.
-"""
-import time
+"""Deterministic stress test for the repository's real adjudication path."""
+
+from __future__ import annotations
+
+import argparse
 import random
-import sys
-from agents.models import SystemTaskPayload
-from agents.supervisor import SystemSupervisor
-from agents.base import PHIGuard, SecurityException, AuditLogger
+import time
+from typing import Dict
 
-def run_simulation(iterations: int = 100):
-    print(f"Starting Distributed Component Simulation on Blood Culture Contamination Tracker ({iterations} tasks)...")
-    supervisor = SystemSupervisor(model_provider="mock")
-    start_time = time.time()
-    nominal_count = 0
-    elevated_count = 0
-    critical_count = 0
-    phi_blocked_count = 0
+from cli import adjudicate_row
 
-    for i in range(iterations):
-        # 1. Normal / Elevated / Critical payload distribution
-        p_val = random.uniform(5.0, 40.0)
-        s_val = random.uniform(1.0, 20.0)
-        is_crit = random.random() < 0.15
-        descriptor = random.choice(["NOMINAL", "DISCORDANT_ANOMALY", "MUTANT_VARIANT", "OPTIMAL"])
 
-        payload = SystemTaskPayload(
-            task_id=f"SIM-{i+1:04d}",
-            target_identifier=f"SPECIMEN-{random.randint(100, 999)}",
-            primary_metric=round(p_val, 2),
-            secondary_metric=round(s_val, 2),
-            status_descriptor=descriptor,
-            is_critical_flag=is_crit
-        )
+ORGANISMS = [
+    "staphylococcus_aureus",
+    "escherichia_coli",
+    "coagulase_negative_staphylococcus",
+    "cutibacterium_acnes",
+    "corynebacterium_species",
+    "pseudomonas_aeruginosa",
+]
 
-        dossier = supervisor.process_task(payload)
-        if dossier.overall_urgency.value == "CRITICAL_STAT_PANIC":
-            critical_count += 1
-        elif dossier.overall_urgency.value == "ELEVATED_RISK":
-            elevated_count += 1
+
+def run_simulation(iterations: int = 100, seed: int = 7, emit: bool = True) -> Dict[str, float]:
+    if iterations <= 0:
+        raise ValueError("iterations must be greater than zero.")
+
+    rng = random.Random(seed)
+    counts = {"contamination": 0, "true_bsi_signal": 0, "indeterminate": 0, "catheter_source": 0}
+    started = time.perf_counter()
+
+    for index in range(iterations):
+        organism = rng.choice(ORGANISMS)
+        drawn = rng.choice([2, 4])
+        positive = rng.randint(0, drawn)
+        site = rng.choice(["peripheral", "central_line"])
+
+        row = {
+            "set_id": f"SIM-{index + 1:05d}",
+            "organism": organism,
+            "bottles_drawn": drawn,
+            "bottles_positive": positive,
+            "draw_site": site,
+        }
+        if positive:
+            row["ttp_hours"] = round(rng.uniform(6.0, 52.0), 1)
+
+        if positive >= 2 and rng.random() < 0.2:
+            central = round(rng.uniform(8.0, 24.0), 1)
+            row["central_ttp_hours"] = central
+            row["peripheral_ttp_hours"] = round(central + rng.uniform(-3.0, 5.0), 1)
+
+        result = adjudicate_row(row)
+        verdict = result["adjudication_verdict"].lower()
+        if result["is_contamination"]:
+            counts["contamination"] += 1
+        elif "catheter-related" in verdict:
+            counts["catheter_source"] += 1
+        elif "true bloodstream" in verdict:
+            counts["true_bsi_signal"] += 1
         else:
-            nominal_count += 1
+            counts["indeterminate"] += 1
 
-        # 2. Adversarial PHI test injection (every 25 iterations)
-        if (i + 1) % 25 == 0:
-            try:
-                PHIGuard.assert_no_phi(f"Patient John Doe MRN-{random.randint(100000, 999999)} test")
-            except SecurityException:
-                phi_blocked_count += 1
+    elapsed = time.perf_counter() - started
+    summary = {
+        "iterations": iterations,
+        "seed": seed,
+        "elapsed_seconds": round(elapsed, 6),
+        "records_per_second": round(iterations / max(elapsed, 1e-9), 1),
+        **counts,
+    }
+    if emit:
+        for key, value in summary.items():
+            print(f"{key}: {value}")
+    return summary
 
-    elapsed = time.time() - start_time
-    print("\n" + "=" * 70)
-    print(f"  SIMULATION SUMMARY FOR BLOOD CULTURE CONTAMINATION TRACKER")
-    print("=" * 70)
-    print(f"  Total Tasks Processed:     {iterations}")
-    print(f"  Elapsed Time:              {elapsed:.3f} seconds ({iterations/max(0.001, elapsed):.1f} tasks/sec)")
-    print(f"  Routine Outcomes:          {nominal_count} ({nominal_count/iterations*100:.1f}%)")
-    print(f"  Elevated Risk Outcomes:    {elevated_count} ({elevated_count/iterations*100:.1f}%)")
-    print(f"  Critical Interventions:    {critical_count} ({critical_count/iterations*100:.1f}%)")
-    print(f"  Adversarial PHI Intercepts:{phi_blocked_count} (100% Interception Rate)")
-    print(f"  HMAC Audit Ledger Blocks:  {len(AuditLogger.get_trail())}")
-    print(f"  HMAC Cryptographic Check:  {AuditLogger.verify_integrity()}")
-    print("=" * 70)
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Stress-test the core adjudication path")
+    parser.add_argument("iterations", nargs="?", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=7)
+    args = parser.parse_args(argv)
+    run_simulation(args.iterations, seed=args.seed)
+    return 0
+
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 100
-    run_simulation(n)
+    raise SystemExit(main())

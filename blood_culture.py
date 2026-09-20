@@ -1,78 +1,103 @@
 #!/usr/bin/env python3
-"""
-Blood Culture Contamination Tracker
-CLSI contamination rate (target <3%) with organism-specific true vs contaminant adjudication.
-Stdlib parser / mapper with batch CSV and single lookup.
-"""
-import argparse, csv, sys, re, json, pathlib
+"""Small compatibility CLI for organism lookup and CSV annotation."""
+
+import argparse
+import csv
+import sys
+
+from blood_culture_tracker import COMMON_CONTAMINANTS, TRUE_PATHOGENS, normalize_organism
+
 
 def lookup(query, extra=None):
-    """Single lookup: token overlap + substring scoring (no deps). Returns top hits."""
-    q = str(query).lower().strip()
-    # tiny built-in dictionary per project slug for demo
-    bank = {
-        "loinc-lab-mapper": [("2160-0 Creatinine","creatinine"),("6690-2 WBC","wbc"),("718-7 Hemoglobin","hemoglobin"),("4548-4 HbA1c","hba1c")],
-        "hla-compatibility-matcher": [("A*02:01","A02"),("B*07:02","B07"),("DRB1*15:01","DRB115")],
-        "icd10-ccsr-mapper": [("I10 Hypertension","I10"),("E11 Type 2 diabetes","E11"),("J18 Pneumonia","J18")],
-        "antibiogram-mdr-classifier": [("MDR","multidrug"),("XDR","extensive"),("PDR","pandrug")],
-        "fhir-bundle-validator": [("Patient","patient"),("Observation","observation")],
-        "cyp-drug-interaction-checker": [("CYP3A4 substrate","cyp3a4"),("CYP2D6 inhibitor","cyp2d6")],
-    }
-    candidates = bank.get("blood-culture-contamination-tracker", [
-        ("Staphylococcus aureus (Pathogen)", "staphylococcus_aureus"),
-        ("Escherichia coli (Pathogen)", "escherichia_coli"),
-        ("Coagulase-negative Staphylococcus (Skin Contaminant)", "coagulase_negative_staphylococcus"),
-        ("Cutibacterium acnes (Skin Contaminant)", "cutibacterium_acnes"),
-        ("Corynebacterium species (Skin Contaminant)", "corynebacterium_species"),
-        ("Pseudomonas aeruginosa (Pathogen)", "pseudomonas_aeruginosa"),
-        ("Streptococcus pneumoniae (Pathogen)", "streptococcus_pneumoniae"),
-    ])
-    scored=[]
-    for label,key in candidates:
+    key = normalize_organism(query)
+    if key in TRUE_PATHOGENS:
+        classification = "configured pathogen"
+        score = 10
+    elif key in COMMON_CONTAMINANTS:
+        classification = "configured common commensal"
+        score = 10
+    else:
+        classification = "unclassified"
         score = 0
-        if key in q: score+=10
-        # token overlap
-        qt=set(q.split()); lt=set(label.lower().split())
-        overlap=len(qt & lt)
-        score+=overlap*2
-        scored.append((score,label))
-    scored.sort(reverse=True)
-    top=scored[0] if scored else (0,"no match")
-    return {"query": query, "top_hit": top[1], "score": top[0], "all": scored[:3]}
 
-def process_csv(inp,out):
-    import csv
-    with open(inp, newline="", encoding="utf-8-sig") as f:
-        r=csv.DictReader(f); rows=list(r); fn=r.fieldnames
-        # guess query column
-        qcol = fn[0]
-        for cand in ["query","test","drug","code","variant","hla","lab","name"]:
-            if cand in [c.lower() for c in fn]:
-                qcol = [c for c in fn if c.lower()==cand][0]; break
-        results=[]
-        for row in rows:
-            res=lookup(row.get(qcol,""), row)
-            merged={**row, "top_hit": res["top_hit"], "lookup_score": res["score"]}
-            results.append(merged)
-    with open(out,"w",newline="",encoding="utf-8") as f:
-        w=csv.DictWriter(f, fieldnames=list(fn)+["top_hit","lookup_score"]); w.writeheader(); w.writerows(results)
+    label = f"{key or 'unknown'} ({classification})"
+    return {
+        "query": query,
+        "top_hit": label,
+        "score": score,
+        "classification": classification,
+        "all": [(score, label)],
+    }
+
+
+def process_csv(inp, out):
+    with open(inp, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+
+    lowered = {name.lower(): name for name in fieldnames}
+    query_column = next(
+        (
+            lowered[name]
+            for name in ("organism", "query", "name", "test", "code")
+            if name in lowered
+        ),
+        fieldnames[0] if fieldnames else None,
+    )
+    if query_column is None:
+        raise ValueError("Input CSV has no header columns.")
+
+    results = []
+    for row in rows:
+        result = lookup(row.get(query_column, ""), row)
+        results.append(
+            {
+                **row,
+                "top_hit": result["top_hit"],
+                "lookup_score": result["score"],
+                "classification": result["classification"],
+            }
+        )
+
+    output_fields = list(fieldnames)
+    for name in ("top_hit", "lookup_score", "classification"):
+        if name not in output_fields:
+            output_fields.append(name)
+
+    with open(out, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=output_fields)
+        writer.writeheader()
+        writer.writerows(results)
     return results
 
+
 def build_parser():
-    p=argparse.ArgumentParser(prog="blood_culture", description="Blood Culture Contamination Tracker")
-    sub=p.add_subparsers(dest="cmd", required=True)
-    s=sub.add_parser("single"); s.add_argument("query", nargs="?", default="creatinine"); s.add_argument("--query", dest="q2")
-    b=sub.add_parser("batch"); b.add_argument("--input", required=True); b.add_argument("--output", required=True)
-    return p
+    parser = argparse.ArgumentParser(
+        prog="blood_culture",
+        description="Blood-culture organism list lookup",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    single = sub.add_parser("single")
+    single.add_argument("query", nargs="?", default="staphylococcus_aureus")
+    single.add_argument("--query", dest="q2")
+    batch = sub.add_parser("batch")
+    batch.add_argument("--input", required=True)
+    batch.add_argument("--output", required=True)
+    return parser
+
 
 def main(argv=None):
-    p=build_parser(); a=p.parse_args(argv)
-    if a.cmd=="single":
-        q=getattr(a,"q2",None) or getattr(a,"query")
-        print(lookup(q)); return 0
-    if a.cmd=="batch":
-        res=process_csv(a.input, a.output); print(f"Processed {len(res)} -> {a.output}"); return 0
-    p.print_help(); return 1
+    args = build_parser().parse_args(argv)
+    if args.cmd == "single":
+        print(lookup(args.q2 or args.query))
+        return 0
+    if args.cmd == "batch":
+        result = process_csv(args.input, args.output)
+        print(f"Processed {len(result)} rows -> {args.output}")
+        return 0
+    return 1
 
-if __name__=="__main__":
-    import sys; sys.exit(main())
+
+if __name__ == "__main__":
+    sys.exit(main())

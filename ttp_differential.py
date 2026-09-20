@@ -1,45 +1,30 @@
 #!/usr/bin/env python3
-"""
-Blood Culture Contamination Tracker — TTP Differential & Rate Analytics
-Time-to-positivity differential algorithms (true bacteremia vs contaminant),
-contamination-rate control limits (Wilson CI + funnel limits), and economic
-impact quantification.
+"""Backward-compatible DTTP and contamination-rate helpers.
 
-Zero-dependency. Author: Dr. Abu Suraih Sakhri. License: MIT.
+This module delegates core calculations to blood_culture_tracker.py so the
+repository has one source of truth for adjudication and statistics.
 """
-import argparse
-import json
-import math
-import sys
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
-
-# Known skin-flora contaminants vs true pathogens
-CONTAMINANT_ORGANISMS = {
-    "coagulase_negative_staphylococcus", "corynebacterium", "cutibacterium_acnes",
-    "micrococcus", "bacillus_species", "viridans_group_streptococci",
-}
-TRUE_PATHOGEN_EXAMPLES = {
-    "staphylococcus_aureus", "escherichia_coli", "klebsiella_pneumoniae",
-    "pseudomonas_aeruginosa", "streptococcus_pneumoniae", "enterococcus_faecalis",
-}
-
-# Published decision thresholds (hours)
-TTP_TRUE_THRESHOLD_H = 15.0      # positivity < 15h: strong true bacteremia signal
-TTP_CONTAMINANT_H = 40.0         # > 40h for skin flora: likely contaminant
-COST_PER_CONTAMINATED = {        # published ranges (US$, 2010s-2020s literature)
-    "extra_length_of_stay": 4800.0,
-    "additional_antimicrobials": 1100.0,
-    "additional_lab_testing": 600.0,
-}
+from blood_culture_tracker import (
+    BloodCultureSet,
+    ContaminationSurveillanceEngine,
+    CultureAdjudicationEngine,
+    CultureBottle,
+    EconomicImpactEngine,
+    normalize_organism,
+)
 
 
 @dataclass
 class CultureSet:
     set_id: str
     organism: Optional[str]
-    ttp_hours: Optional[float]          # time to positivity of first bottle
+    ttp_hours: Optional[float]
     bottles_drawn: int
     bottles_positive: int
     central_only_positive: bool = False
@@ -48,145 +33,122 @@ class CultureSet:
 
 
 def adjudicate(cs: CultureSet) -> Dict[str, Any]:
-    """Rule-based true-pathogen-vs-contaminant classification with reasoning."""
-    reasons, points = [], 0
-    is_contaminant_species = cs.organism in CONTAMINANT_ORGANISMS if cs.organism else False
-    is_pathogen_species = cs.organism in TRUE_PATHOGEN_EXAMPLES if cs.organism else False
+    if cs.bottles_drawn <= 0 or not 0 <= cs.bottles_positive <= cs.bottles_drawn:
+        raise ValueError("Bottle counts must satisfy 0 <= positive <= drawn and drawn > 0.")
 
-    if cs.ttp_hours is not None:
-        if cs.ttp_hours < TTP_TRUE_THRESHOLD_H:
-            points += 2; reasons.append(f"TTP {cs.ttp_hours:.1f}h < {TTP_TRUE_THRESHOLD_H:.0f}h (+2)")
-        elif cs.ttp_hours > TTP_CONTAMINANT_H and is_contaminant_species:
-            points -= 2; reasons.append(f"skin flora at TTP {cs.ttp_hours:.1f}h (>40h) (-2)")
+    explicit = int(cs.peripheral_ttp_hours is not None) + int(cs.central_ttp_hours is not None)
+    if explicit > cs.bottles_positive:
+        raise ValueError("Paired TTP inputs exceed bottles_positive.")
 
-    if is_pathogen_species:
-        points += 2; reasons.append("obligate/typical pathogen species (+2)")
-    if is_contaminant_species:
-        points -= 1; reasons.append("recognized skin flora species (-1)")
+    organism = normalize_organism(cs.organism)
+    bottles: List[CultureBottle] = []
 
-    frac = cs.bottles_positive / max(cs.bottles_drawn, 1)
-    if frac >= 0.5 and cs.bottles_drawn >= 2:
-        points += 1; reasons.append(f">=50% bottles positive ({cs.bottles_positive}/{cs.bottles_drawn}) (+1)")
-    elif frac <= 0.25 and cs.bottles_drawn >= 4:
-        points -= 1; reasons.append("<25% bottles positive in full set (-1)")
+    if cs.peripheral_ttp_hours is not None:
+        bottles.append(
+            CultureBottle(
+                f"{cs.set_id}-P",
+                "peripheral",
+                cs.peripheral_ttp_hours,
+                True,
+                organism,
+            )
+        )
+    if cs.central_ttp_hours is not None:
+        bottles.append(
+            CultureBottle(
+                f"{cs.set_id}-C",
+                "central_line",
+                cs.central_ttp_hours,
+                True,
+                organism,
+            )
+        )
 
-    # bottle-pair differential logic
-    differential = None
-    if cs.peripheral_ttp_hours is not None and cs.central_ttp_hours is not None:
-        differential = round(cs.central_ttp_hours - cs.peripheral_ttp_hours, 2)
-        if abs(differential) >= 2.0:
-            points += 2; reasons.append(
-                f"|central-peripheral| differential {differential}h >= 2h suggests catheter source (+2)")
-        elif abs(differential) < 1.0 and is_contaminant_species:
-            points -= 1; reasons.append("concordant rapid positivity both sites; CoNS less concerning (-1)")
-    elif cs.central_only_positive and is_contaminant_species:
-        points += 1; reasons.append("CoNS from central bottles only: CLABSI possible (+1)")
+    default_site = "central_line" if cs.central_only_positive else "peripheral"
+    for index in range(cs.bottles_positive - len(bottles)):
+        bottles.append(
+            CultureBottle(
+                f"{cs.set_id}-POS-{index + 1}",
+                default_site,
+                cs.ttp_hours,
+                True,
+                organism,
+            )
+        )
+    for index in range(cs.bottles_drawn - len(bottles)):
+        bottles.append(CultureBottle(f"{cs.set_id}-NEG-{index + 1}", "peripheral", None, False, None))
 
-    verdict = ("likely_true_bacteremia" if points >= 2 else
-               "indeterminate" if points == 1 or points == -1 or points == 0 else
-               "probable_contamination")
+    result = CultureAdjudicationEngine.adjudicate_set(
+        BloodCultureSet(cs.set_id, "PT-UNKNOWN", "Unknown", bottles)
+    )
+
+    if result["is_contamination"]:
+        verdict = "probable_contamination"
+    elif result["confidence_score"] >= 2:
+        verdict = "likely_true_bacteremia"
+    else:
+        verdict = "indeterminate"
+
     return {
         "set_id": cs.set_id,
-        "organism": cs.organism,
-        "central_peripheral_ttp_differential_h": differential,
-        "evidence_points": points,
-        "reasoning": reasons,
+        "organism": organism,
+        "central_peripheral_ttp_differential_h": result.get("dttp_hours"),
+        "evidence_points": result["confidence_score"],
+        "reasoning": result["reasoning"],
         "verdict": verdict,
+        "detail": result["verdict"],
     }
 
 
-def contamination_rate_stats(sets: List[Dict[str, Any]], target_pct: float = 3.0) -> Dict[str, Any]:
-    """Overall + per-unit contamination rates with Wilson CIs and funnel limits."""
-    n = len(sets)
-    contaminated = sum(1 for s in sets if s.get("adjudicated_as_contamination"))
-    rate = 100 * contaminated / n if n else 0.0
-    ci = _wilson_ci_pct(contaminated, n)
-
-    by_unit: Dict[str, Dict[str, int]] = {}
-    for s in sets:
-        unit = s.get("collection_unit", "UNKNOWN")
-        agg = by_unit.setdefault(unit, {"total": 0, "contaminated": 0})
-        agg["total"] += 1
-        if s.get("adjudicated_as_contamination"):
-            agg["contaminated"] += 1
-
-    pbar = contaminated / n if n else 0.0
-    funnel = {}
-    for unit, agg in by_unit.items():
-        nu = agg["total"]
-        ku = agg["contaminated"]
-        ru = 100 * ku / nu if nu else 0
-        half = 1.96 * math.sqrt(max(pbar * (1 - pbar), 1e-9) / nu) * 100 if nu else 0
-        funnel[unit] = {
-            "rate_pct": round(ru, 2),
-            "n": nu,
-            "above_95pct_limit": ru > pbar * 100 + half,
-            "limit_95pct": [round(max(pbar * 100 - half, 0.0), 2), round(pbar * 100 + half, 2)],
+def contamination_rate_stats(
+    sets: List[Dict[str, Any]], target_pct: float = 3.0
+) -> Dict[str, Any]:
+    mapped = [
+        {
+            "is_contamination": bool(row.get("adjudicated_as_contamination")),
+            "collection_unit": row.get("collection_unit", "UNKNOWN"),
         }
-
+        for row in sets
+    ]
+    result = ContaminationSurveillanceEngine.analyze_surveillance_data(
+        mapped, target_pct=target_pct
+    )
+    funnel = {
+        unit: {
+            "rate_pct": data["rate_percentage"],
+            "n": data["total_sets"],
+            "above_95pct_limit": data["outlier_95"],
+            "limit_95pct": [0.0, data["upper_control_limit_95"]],
+        }
+        for unit, data in result["unit_funnel_analytics"].items()
+    }
     return {
-        "sets_analyzed": n,
-        "contaminated": contaminated,
-        "overall_rate_pct": round(rate, 2),
-        "wilson_95ci_pct": [round(x, 2) for x in ci],
+        "sets_analyzed": result["total_sets_evaluated"],
+        "contaminated": result["contaminated_sets_count"],
+        "overall_rate_pct": result["overall_contamination_rate_pct"],
+        "wilson_95ci_pct": result["wilson_95ci_pct"],
         "target_pct": target_pct,
-        "meets_clsi_target": rate < target_pct,
+        "meets_configured_target": result["meets_configured_target"],
+        "meets_clsi_target": result["meets_configured_target"],
         "by_collection_unit_funnel": funnel,
     }
 
 
 def _wilson_ci_pct(k: int, n: int, z: float = 1.96) -> List[float]:
-    if not n:
-        return [0.0, 0.0]
-    p = k / n
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denom
-    return [max(0, (center - half)) * 100, min(1, center + half) * 100]
+    lower, upper = ContaminationSurveillanceEngine.calculate_wilson_ci(k, n, z)
+    return [lower, upper]
 
 
-def economic_impact(contaminated_sets: int,
-                    costs: Dict[str, float] = None) -> Dict[str, Any]:
-    c = dict(COST_PER_CONTAMINATED)
-    if costs:
-        c.update(costs)
-    per_case = sum(c.values())
-    total = per_case * contaminated_sets
+def economic_impact(
+    contaminated_sets: int, costs: Optional[Dict[str, float]] = None
+) -> Dict[str, Any]:
+    result = EconomicImpactEngine.calculate_cost(contaminated_sets, costs)
     return {
-        "tool": "blood-culture-contamination-tracker/enriched",
+        "tool": "blood-culture-contamination-tracker",
         "contaminated_sets": contaminated_sets,
-        "cost_breakdown_per_case_usd": c,
-        "cost_per_contaminated_set_usd": round(per_case, 2),
-        "estimated_total_cost_usd": round(total, 2),
-        "avoidable_if_rate_halved_usd": round(total / 2, 2),
+        "cost_breakdown_per_case_usd": result["cost_breakdown_per_contamination_usd"],
+        "cost_per_contaminated_set_usd": result["total_cost_per_case_usd"],
+        "estimated_total_cost_usd": result["estimated_annual_excess_cost_usd"],
+        "avoidable_if_rate_halved_usd": result["potential_savings_50pct_reduction_usd"],
+        "assumption_note": result["assumption_note"],
     }
-
-
-if __name__ == "__main__":
-    cases = [
-        CultureSet("BC001", "staphylococcus_aureus", ttp_hours=9.5, bottles_drawn=2,
-                   bottles_positive=2, central_ttp_hours=9.5, peripheral_ttp_hours=14.0),
-        CultureSet("BC002", "coagulase_negative_staphylococcus", ttp_hours=44.0,
-                   bottles_drawn=4, bottles_positive=1,
-                   peripheral_ttp_hours=44.0, central_ttp_hours=None),
-        CultureSet("BC003", "coagulase_negative_staphylococcus", ttp_hours=11.0,
-                   bottles_drawn=2, bottles_positive=1, central_only_positive=True,
-                   central_ttp_hours=11.0),
-        CultureSet("BC004", "escherichia_coli", ttp_hours=7.8, bottles_drawn=2,
-                   bottles_positive=2),
-    ]
-    for c in cases:
-        print(json.dumps(adjudicate(c), indent=2))
-
-    ledger = [
-        {"id": "BC001", "adjudicated_as_contamination": False, "collection_unit": "ED"},
-        {"id": "BC002", "adjudicated_as_contamination": True, "collection_unit": "ED"},
-        {"id": "BC003", "adjudicated_as_contamination": False, "collection_unit": "ICU"},
-        {"id": "BC004", "adjudicated_as_contamination": False, "collection_unit": "ICU"},
-        {"id": "BC005", "adjudicated_as_contamination": True, "collection_unit": "WARD3"},
-        {"id": "BC006", "adjudicated_as_contamination": True, "collection_unit": "WARD3"},
-        {"id": "BC007", "adjudicated_as_contamination": False, "collection_unit": "WARD3"},
-        {"id": "BC008", "adjudicated_as_contamination": False, "collection_unit": "ICU"},
-    ]
-    print(json.dumps(contamination_rate_stats(ledger), indent=2))
-    print(json.dumps(economic_impact(3), indent=2))

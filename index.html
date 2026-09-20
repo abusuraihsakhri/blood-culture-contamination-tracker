@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Browser-based blood culture contamination and differential time-to-positivity decision-support calculator.">
+  <title>Blood Culture Contamination Tracker</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="web_core.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div>
+      <p class="eyebrow">Clinical microbiology utility</p>
+      <h1>Blood Culture Contamination Tracker</h1>
+      <p class="subtitle">Rule-based contamination signals, DTTP interpretation, and surveillance statistics.</p>
+    </div>
+    <button class="icon-button" id="theme-toggle" type="button" aria-label="Switch to dark theme" title="Toggle theme">
+      <span aria-hidden="true" id="theme-icon">◐</span>
+    </button>
+  </header>
+
+  <main class="app-shell">
+    <nav class="tabs" aria-label="Calculator mode">
+      <button class="tab is-active" type="button" data-tab="case" aria-selected="true">Case review</button>
+      <button class="tab" type="button" data-tab="surveillance" aria-selected="false">Surveillance</button>
+    </nav>
+
+    <section class="panel-grid" id="case-panel" aria-label="Case review">
+      <form class="card input-card" id="case-form" novalidate>
+        <div class="card-heading">
+          <div>
+            <p class="section-kicker">Inputs</p>
+            <h2>Culture set</h2>
+          </div>
+          <button type="button" class="text-button" id="case-example">Load example</button>
+        </div>
+
+        <div class="field field-wide">
+          <label for="organism">Organism</label>
+          <input id="organism" name="organism" list="organism-list" value="coagulase_negative_staphylococcus" autocomplete="off" spellcheck="false" required>
+          <datalist id="organism-list">
+            <option value="staphylococcus_aureus"></option>
+            <option value="escherichia_coli"></option>
+            <option value="pseudomonas_aeruginosa"></option>
+            <option value="coagulase_negative_staphylococcus"></option>
+            <option value="staphylococcus_epidermidis"></option>
+            <option value="cutibacterium_acnes"></option>
+            <option value="corynebacterium_species"></option>
+          </datalist>
+        </div>
+
+        <div class="field-grid">
+          <div class="field">
+            <label for="bottles-drawn">Bottles drawn</label>
+            <input id="bottles-drawn" type="number" min="1" step="1" value="4" required>
+          </div>
+          <div class="field">
+            <label for="bottles-positive">Bottles positive</label>
+            <input id="bottles-positive" type="number" min="0" step="1" value="1" required>
+          </div>
+          <div class="field">
+            <label for="ttp">Shortest TTP, h <span class="optional">optional</span></label>
+            <input id="ttp" type="number" min="0" step="0.1" value="44">
+          </div>
+          <div class="field">
+            <label for="draw-site">Collection site</label>
+            <select id="draw-site">
+              <option value="peripheral">Peripheral</option>
+              <option value="central_line">Central line</option>
+              <option value="picc">PICC</option>
+            </select>
+          </div>
+        </div>
+
+        <fieldset class="paired-fieldset">
+          <legend>Paired DTTP <span class="optional">optional</span></legend>
+          <div class="field-grid paired-grid">
+            <div class="field">
+              <label for="central-ttp">Central-line TTP, h</label>
+              <input id="central-ttp" type="number" min="0" step="0.1" placeholder="e.g. 14">
+            </div>
+            <div class="field">
+              <label for="peripheral-ttp">Peripheral TTP, h</label>
+              <input id="peripheral-ttp" type="number" min="0" step="0.1" placeholder="e.g. 18">
+            </div>
+          </div>
+        </fieldset>
+
+        <p class="form-error" id="case-error" role="alert" aria-live="polite"></p>
+        <button class="primary-button" id="analyze-case" type="submit">Analyze culture set</button>
+      </form>
+
+      <section class="card result-card" aria-live="polite" aria-label="Case result">
+        <div class="card-heading">
+          <div>
+            <p class="section-kicker">Result</p>
+            <h2 id="case-verdict">Ready for analysis</h2>
+          </div>
+          <span class="status-chip neutral" id="contamination-chip">No result</span>
+        </div>
+
+        <div class="metrics-row">
+          <div class="metric">
+            <span>Rule score</span>
+            <strong id="case-score">—</strong>
+          </div>
+          <div class="metric">
+            <span>Concordance</span>
+            <strong id="case-concordance">—</strong>
+          </div>
+          <div class="metric">
+            <span>DTTP</span>
+            <strong id="case-dttp">—</strong>
+          </div>
+        </div>
+
+        <div class="reasoning-box">
+          <h3>Rule trace</h3>
+          <ul id="case-reasons"><li>Enter culture data and select Analyze.</li></ul>
+        </div>
+        <p class="recommendation" id="case-recommendation">This tool provides transparent decision-support signals, not a diagnosis or NHSN CLABSI determination.</p>
+      </section>
+    </section>
+
+    <section class="panel-grid is-hidden" id="surveillance-panel" aria-label="Surveillance calculator">
+      <form class="card input-card compact-form" id="surveillance-form" novalidate>
+        <div class="card-heading">
+          <div>
+            <p class="section-kicker">Inputs</p>
+            <h2>Contamination rate</h2>
+          </div>
+        </div>
+        <div class="field-grid">
+          <div class="field">
+            <label for="total-cultures">Total culture sets</label>
+            <input id="total-cultures" type="number" min="0" step="1" value="250" required>
+          </div>
+          <div class="field">
+            <label for="contaminated-cultures">Contaminated sets</label>
+            <input id="contaminated-cultures" type="number" min="0" step="1" value="5" required>
+          </div>
+          <div class="field field-wide">
+            <label for="target-pct">Configured quality target, %</label>
+            <input id="target-pct" type="number" min="0" max="100" step="0.1" value="3.0" required>
+          </div>
+        </div>
+        <p class="form-note">The 3% default is configurable and should be interpreted using your laboratory's current policy and quality program.</p>
+        <p class="form-error" id="surveillance-error" role="alert" aria-live="polite"></p>
+        <button class="primary-button" id="analyze-surveillance" type="submit">Analyze surveillance rate</button>
+      </form>
+
+      <section class="card result-card" aria-live="polite" aria-label="Surveillance result">
+        <div class="card-heading">
+          <div>
+            <p class="section-kicker">Result</p>
+            <h2 id="surveillance-status">Ready for analysis</h2>
+          </div>
+          <span class="status-chip neutral" id="target-chip">No result</span>
+        </div>
+        <div class="metrics-row surveillance-metrics">
+          <div class="metric">
+            <span>Rate</span>
+            <strong id="surveillance-rate">—</strong>
+          </div>
+          <div class="metric">
+            <span>Wilson 95% CI</span>
+            <strong id="surveillance-ci">—</strong>
+          </div>
+          <div class="metric">
+            <span>Target</span>
+            <strong id="surveillance-target">—</strong>
+          </div>
+        </div>
+        <div class="reasoning-box">
+          <h3>Interpretation</h3>
+          <p id="surveillance-copy">Enter counts and select Analyze.</p>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer>
+    <p>Runs entirely in your browser. No patient identifiers are requested or transmitted. For quality improvement and educational use; validate locally before operational use.</p>
+  </footer>
+</body>
+</html>
