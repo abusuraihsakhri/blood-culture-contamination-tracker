@@ -1,14 +1,21 @@
-import blood_culture as m, pathlib
+from pathlib import Path
 
-def test_lookup():
-    r = m.lookup('staphylococcus_aureus')
-    assert 'top_hit' in r and 'score' in r
-    root = pathlib.Path(__file__).parent.parent
-    out_file = root / 'tmp_test_out.csv'
-    try:
-        rows = m.process_csv(str(root / 'sample.csv'), str(out_file))
-        assert len(rows) >= 1
-    finally:
-        if out_file.exists():
-            out_file.unlink()
+import blood_culture as module
 
+
+def test_lookup_uses_blood_culture_organism_lists():
+    pathogen = module.lookup("Staphylococcus aureus")
+    contaminant = module.lookup("coagulase-negative staphylococci")
+    unknown = module.lookup("example organism")
+    assert pathogen["classification"] == "configured pathogen"
+    assert contaminant["classification"] == "configured common commensal"
+    assert unknown["classification"] == "unclassified"
+
+
+def test_process_csv_prefers_organism_column(tmp_path):
+    root = Path(__file__).parents[1]
+    output = tmp_path / "lookup.csv"
+    rows = module.process_csv(str(root / "sample.csv"), str(output))
+    assert len(rows) == 15
+    assert rows[0]["classification"] == "configured common commensal"
+    assert rows[1]["classification"] == "configured pathogen"

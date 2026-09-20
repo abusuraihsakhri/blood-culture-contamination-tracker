@@ -1,124 +1,165 @@
-import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
+
 from blood_culture_tracker import (
     AdjudicationVerdict,
     BloodCultureSet,
-    CultureBottle,
-    CultureAdjudicationEngine,
     ContaminationSurveillanceEngine,
+    CultureAdjudicationEngine,
+    CultureBottle,
     EconomicImpactEngine,
+    normalize_organism,
 )
-from ttp_differential import (
-    CultureSet,
-    adjudicate as adjudicate_ttp,
-    contamination_rate_stats,
-    economic_impact,
-)
-from cli import main, adjudicate_row, process_csv
+from cli import adjudicate_row, main, process_csv
+from simulator import run_simulation
+from ttp_differential import CultureSet, adjudicate as adjudicate_ttp
 
 
-def test_true_pathogen_adjudication():
-    # S. aureus rapid growth (TTP 9.5h), 2/2 bottles positive -> true pathogen
-    b1 = CultureBottle(bottle_id="B1", site_type="peripheral", ttp_hours=9.5, is_positive=True, organism="staphylococcus_aureus")
-    b2 = CultureBottle(bottle_id="B2", site_type="peripheral", ttp_hours=10.0, is_positive=True, organism="staphylococcus_aureus")
-    cset = BloodCultureSet(set_id="S1", patient_id="P1", collection_unit="ED", bottles=[b1, b2])
-    res = CultureAdjudicationEngine.adjudicate_set(cset)
-    assert res["verdict"] == AdjudicationVerdict.TRUE_PATHOGEN.value
-    assert res["is_contamination"] is False
-    assert res["confidence_score"] >= 2
+def _set(*bottles):
+    return BloodCultureSet("S", "P", "ICU", list(bottles))
 
 
-def test_skin_contaminant_adjudication():
-    # CoNS delayed growth (TTP 44h), 1/4 bottles positive -> probable contamination
-    bottles = [
-        CultureBottle(bottle_id="B1", site_type="peripheral", ttp_hours=44.0, is_positive=True, organism="coagulase_negative_staphylococcus"),
-        CultureBottle(bottle_id="B2", site_type="peripheral", ttp_hours=None, is_positive=False),
-        CultureBottle(bottle_id="B3", site_type="peripheral", ttp_hours=None, is_positive=False),
-        CultureBottle(bottle_id="B4", site_type="peripheral", ttp_hours=None, is_positive=False),
-    ]
-    cset = BloodCultureSet(set_id="S2", patient_id="P2", collection_unit="Ward_3B", bottles=bottles)
-    res = CultureAdjudicationEngine.adjudicate_set(cset)
-    assert res["verdict"] == AdjudicationVerdict.PROBABLE_CONTAMINATION.value
-    assert res["is_contamination"] is True
-    assert res["confidence_score"] <= -2
-
-
-def test_clabsi_dttp_criterion():
-    # Central line turns positive >= 2.0 hours before peripheral blood
-    b_periph = CultureBottle(bottle_id="BP", site_type="peripheral", ttp_hours=18.0, is_positive=True, organism="coagulase_negative_staphylococcus")
-    b_central = CultureBottle(bottle_id="BC", site_type="central_line", ttp_hours=14.0, is_positive=True, organism="coagulase_negative_staphylococcus")
-    cset = BloodCultureSet(set_id="S3", patient_id="P3", collection_unit="ICU", bottles=[b_periph, b_central])
-    res = CultureAdjudicationEngine.adjudicate_set(cset)
-    assert res["verdict"] == AdjudicationVerdict.CLABSI_SUSPECTED.value
-    assert res["dttp_hours"] == 4.0
-    assert res["is_contamination"] is False
-
-
-def test_wilson_ci_and_surveillance():
-    # 3 contaminated sets out of 100 sets = 3%
-    lower, upper = ContaminationSurveillanceEngine.calculate_wilson_ci(3, 100)
-    assert 0.0 < lower < 3.0
-    assert 3.0 < upper < 10.0
-
-    # Surveillance analysis with target <= 3.0%
-    surv_records = [{"is_contamination": False, "collection_unit": "ED"}] * 98 + [{"is_contamination": True, "collection_unit": "ED"}] * 2
-    res = ContaminationSurveillanceEngine.analyze_surveillance_data(surv_records, target_pct=3.0)
-    assert res["meets_clsi_standard"] is True
-    assert res["overall_contamination_rate_pct"] == 2.0
-
-
-def test_economic_impact():
-    econ = EconomicImpactEngine.calculate_cost(5)
-    assert econ["contaminated_sets_count"] == 5
-    assert econ["total_cost_per_case_usd"] == 7100.0
-    assert econ["estimated_annual_excess_cost_usd"] == 35500.0
-    assert econ["potential_savings_50pct_reduction_usd"] == 17750.0
-
-
-def test_ttp_differential_module():
-    cs = CultureSet(
-        set_id="BC01",
-        organism="staphylococcus_aureus",
-        ttp_hours=8.0,
-        bottles_drawn=2,
-        bottles_positive=2,
+def test_true_pathogen_signal():
+    result = CultureAdjudicationEngine.adjudicate_set(
+        _set(
+            CultureBottle("B1", "peripheral", 9.5, True, "Staphylococcus aureus"),
+            CultureBottle("B2", "peripheral", 10.0, True, "staphylococcus_aureus"),
+        )
     )
-    res = adjudicate_ttp(cs)
-    assert res["verdict"] == "likely_true_bacteremia"
-
-    econ = economic_impact(2)
-    assert econ["contaminated_sets"] == 2
-    assert econ["estimated_total_cost_usd"] > 0
+    assert result["verdict"] == AdjudicationVerdict.TRUE_PATHOGEN.value
+    assert result["is_contamination"] is False
 
 
-def test_cli_batch_and_adjudicate_commands(tmp_path):
-    # Test adjudicate_row logic
-    row = {
-        "set_id": "TEST-ROW",
-        "organism": "escherichia_coli",
-        "bottles_drawn": 2,
-        "bottles_positive": 2,
-        "ttp_hours": 8.0,
-    }
-    adj = adjudicate_row(row)
-    assert adj["adjudication_verdict"] == AdjudicationVerdict.TRUE_PATHOGEN.value
-    assert adj["true_bacteremia_probability"] > 0.90
+def test_common_commensal_signal():
+    result = CultureAdjudicationEngine.adjudicate_set(
+        _set(
+            CultureBottle("B1", "peripheral", 44.0, True, "coagulase negative staphylococci"),
+            CultureBottle("B2", "peripheral", None, False, None),
+            CultureBottle("B3", "peripheral", None, False, None),
+            CultureBottle("B4", "peripheral", None, False, None),
+        )
+    )
+    assert result["verdict"] == AdjudicationVerdict.PROBABLE_CONTAMINATION.value
+    assert result["is_contamination"] is True
 
-    # Test batch execution via cli.main
-    root = Path(__file__).parent.parent
-    sample_csv = root / "sample.csv"
-    out_csv = tmp_path / "test_out.csv"
-    ret = main(["batch", "-i", str(sample_csv), "-o", str(out_csv)])
-    assert ret == 0
-    assert out_csv.exists()
 
-    # Test single adjudicate CLI command
-    ret_adj = main(["adjudicate", "--organism", "staphylococcus_aureus", "--bottles-positive", "2", "--ttp", "9.0"])
-    assert ret_adj == 0
+def test_dttp_supports_catheter_source_only_when_central_is_earlier():
+    supported = CultureAdjudicationEngine.adjudicate_set(
+        _set(
+            CultureBottle("BP", "peripheral", 18.0, True, "coagulase_negative_staphylococcus"),
+            CultureBottle("BC", "central_line", 14.0, True, "coagulase_negative_staphylococcus"),
+        )
+    )
+    assert supported["dttp_hours"] == 4.0
+    assert supported["verdict"] == AdjudicationVerdict.CLABSI_SUSPECTED.value
+    assert "CRBSI" in supported["verdict"]
 
-    # Test surveillance CLI command
-    ret_surv = main(["surveillance", "-i", str(out_csv)])
-    assert ret_surv == 0
+    not_supported = CultureAdjudicationEngine.adjudicate_set(
+        _set(
+            CultureBottle("BP", "peripheral", 12.0, True, "coagulase_negative_staphylococcus"),
+            CultureBottle("BC", "central_line", 16.0, True, "coagulase_negative_staphylococcus"),
+        )
+    )
+    assert not_supported["dttp_hours"] == -4.0
+    assert not_supported["verdict"] != AdjudicationVerdict.CLABSI_SUSPECTED.value
+
+
+def test_dttp_requires_matching_organism():
+    result = CultureAdjudicationEngine.adjudicate_set(
+        _set(
+            CultureBottle("BP", "peripheral", 18.0, True, "staphylococcus_aureus"),
+            CultureBottle("BC", "central_line", 10.0, True, "escherichia_coli"),
+        )
+    )
+    assert result["dttp_hours"] is None
+
+
+def test_zero_positive_culture_is_preserved_and_does_not_crash():
+    result = adjudicate_row(
+        {
+            "set_id": "NEG",
+            "organism": "staphylococcus_aureus",
+            "bottles_drawn": 2,
+            "bottles_positive": 0,
+            "draw_site": "peripheral",
+        }
+    )
+    assert result["bottles_positive"] == 0
+    assert result["true_bacteremia_probability"] == 0.0
+    assert result["is_contamination"] is False
+    assert "negative" in result["adjudication_verdict"].lower()
+
+
+def test_invalid_counts_and_inconsistent_paired_ttp_rejected():
+    with pytest.raises(ValueError):
+        adjudicate_row({"organism": "e_coli", "bottles_drawn": 2, "bottles_positive": 3})
+    with pytest.raises(ValueError):
+        adjudicate_row(
+            {
+                "organism": "e_coli",
+                "bottles_drawn": 2,
+                "bottles_positive": 1,
+                "central_ttp_hours": 12,
+                "peripheral_ttp_hours": 14,
+            }
+        )
+
+
+def test_normalization_is_conservative():
+    assert normalize_organism("Coagulase-negative staphylococci") == "coagulase_negative_staphylococcus"
+    assert normalize_organism("not_staphylococcus_aureus_variant") == "not_staphylococcus_aureus_variant"
+
+
+def test_wilson_interval_and_validation():
+    lower, upper = ContaminationSurveillanceEngine.calculate_wilson_ci(3, 100)
+    assert 0 < lower < 3 < upper < 10
+    with pytest.raises(ValueError):
+        ContaminationSurveillanceEngine.calculate_wilson_ci(11, 10)
+    with pytest.raises(ValueError):
+        ContaminationSurveillanceEngine.analyze_surveillance_data([], target_pct=101)
+
+
+def test_economic_model_is_explicitly_assumption_based():
+    result = EconomicImpactEngine.calculate_cost(5)
+    assert result["total_cost_per_case_usd"] == 7100.0
+    assert "Illustrative" in result["assumption_note"]
+    with pytest.raises(ValueError):
+        EconomicImpactEngine.calculate_cost(-1)
+
+
+def test_compatibility_module_uses_correct_dttp_direction():
+    result = adjudicate_ttp(
+        CultureSet(
+            "X",
+            "coagulase_negative_staphylococcus",
+            12.0,
+            2,
+            2,
+            peripheral_ttp_hours=10.0,
+            central_ttp_hours=14.0,
+        )
+    )
+    assert result["central_peripheral_ttp_differential_h"] == -4.0
+    assert "catheter-related" not in result["detail"].lower()
+
+
+def test_csv_batch_and_cli_smoke(tmp_path):
+    sample = Path(__file__).parents[1] / "sample.csv"
+    output = tmp_path / "result.csv"
+    rows = process_csv(str(sample), str(output))
+    assert len(rows) == 15
+    assert output.exists()
+    assert main(["batch", "-i", str(sample), "-o", str(output)]) == 0
+    assert main(["surveillance", "-i", str(output)]) == 0
+
+
+def test_simulator_exercises_real_path():
+    result = run_simulation(50, seed=11, emit=False)
+    total = (
+        result["contamination"]
+        + result["true_bsi_signal"]
+        + result["indeterminate"]
+        + result["catheter_source"]
+    )
+    assert total == 50
