@@ -1,5 +1,7 @@
 # Blood Culture Contamination Tracker
 
+### [Open the Live Application →](https://abusuraihsakhri.github.io/blood-culture-contamination-tracker/)
+
 A small Python and browser-based utility for transparent blood-culture contamination heuristics, differential time-to-positivity (DTTP) interpretation, Wilson confidence intervals, and contamination-rate surveillance.
 
 The calculations are rule-based decision-support aids. They are not a validated diagnostic model and do not replace laboratory, infectious-disease, infection-prevention, or NHSN surveillance review.
